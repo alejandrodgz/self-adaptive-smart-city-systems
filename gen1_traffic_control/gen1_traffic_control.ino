@@ -1,78 +1,95 @@
 // =================================================================
-//  Smart City Traffic System - Generation 1 (Low Level)
-//  Project: Self-Adaptive Systems
+//  Sistema de Tráfico Ciudad Inteligente - Generación 1 (Nivel Bajo)
+//  Proyecto: Sistemas Auto-Adaptativos
 // =================================================================
-//  This code implements a context-aware traffic control system
-//  with four predefined operation modes. It adjusts its behavior
-//  based on environmental and traffic conditions but does not learn.
+//  Este código implementa un sistema de control de tráfico consciente
+//  del contexto con cuatro modos de operación predefinidos. Ajusta su
+//  comportamiento según condiciones ambientales y de tráfico pero no aprende.
 
 // =================================================================
 
-// -- Pin Definitions --
-// --- Microcontroller ---
+// -- Definiciones de Pines --
+// --- Microcontrolador ---
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// --- Traffic Light 1 ---
-#define LR1 5   // Red
-#define LY1 4   // Yellow
-#define LG1 6   // Green
+// --- Semáforo 1 ---
+#define LR1 5   // Rojo
+#define LY1 4   // Amarillo
+#define LG1 6   // Verde
 
-// --- Traffic Light 2 ---
-#define LR2 7   // Red
-#define LY2 15  // Yellow
-#define LG2 16  // Green
+// --- Semáforo 2 ---
+#define LR2 7   // Rojo
+#define LY2 15  // Amarillo
+#define LG2 16  // Verde
 
-// --- Pedestrian Buttons ---
-#define P1 2    // Button for Traffic Light 1
-#define P2 1    // Button for Traffic Light 2 (Note: P1/P2 pins swapped from initial description to match diagram)
+// --- Botones Peatonales ---
+#define P1 2    // Botón para Semáforo 1
+#define P2 1    // Botón para Semáforo 2
 
-// --- Vehicle Sensors (Infrared) ---
-#define CNY1 42 // Sensor 1, Direction 1
-#define CNY2 41 // Sensor 2, Direction 1
-#define CNY3 40 // Sensor 3, Direction 1
-#define CNY4 39 // Sensor 4, Direction 2
-#define CNY5 38 // Sensor 5, Direction 2
-#define CNY6 37 // Sensor 6, Direction 2
+// --- Sensores de Vehículos (Infrarrojo) ---
+#define CNY1 42 // Sensor 1, Dirección 1
+#define CNY2 41 // Sensor 2, Dirección 1
+#define CNY3 40 // Sensor 3, Dirección 1
+#define CNY4 39 // Sensor 4, Dirección 2
+#define CNY5 38 // Sensor 5, Dirección 2
+#define CNY6 37 // Sensor 6, Dirección 2
 
-// --- Environmental Sensors ---
-#define LDR1 13 // Light Sensor 1
-#define LDR2 12 // Light Sensor 2
-#define CO2_PIN 14 // CO2 Sensor
+// --- Sensores Ambientales ---
+#define LDR1 13 // Sensor de Luz 1
+#define LDR2 12 // Sensor de Luz 2
+#define CO2_PIN 14 // Sensor CO2
 
-// -- System Configuration --
-#define NIGHT_MODE_THRESHOLD 1000 // LDR value to trigger night mode (adjust based on sensor readings)
-#define HEAVY_TRAFFIC_DIFF 3      // Vehicle count difference to trigger heavy traffic mode
-#define PEDESTRIAN_CROSS_TIME 15000 // 15 seconds for pedestrians to cross
+// -- Configuración del Sistema --
+#define NIGHT_MODE_THRESHOLD 300  // Valor del LDR para activar modo nocturno (LDR lee BAJO en oscuridad)
+#define HEAVY_TRAFFIC_DIFF 3      // Diferencia de vehículos para activar modo tráfico pesado
+#define PEDESTRIAN_CROSS_TIME 15000 // 15 segundos para cruce peatonal
+#define CO2_HIGH_THRESHOLD 600    // Valor de CO2 para activar modo reducción de emisiones
 
-// -- LCD Display --
-LiquidCrystal_I2C lcd(0x27, 20, 4); // I2C address 0x27, 20 column and 4 rows
+// -- Pantalla LCD --
+LiquidCrystal_I2C lcd(0x27, 20, 4); // Dirección I2C 0x27, 20 columnas y 4 filas
 
-// -- Global State Variables --
-enum State { NORMAL, NIGHT, HEAVY_TRAFFIC, PEDESTRIAN };
-State currentState = NORMAL;
+// -- Variables de Estado Globales --
+enum Estado { NORMAL, NOCTURNO, TRAFICO_PESADO, PEATONAL, EMISION };
+Estado estadoActual = NORMAL;
 
+// Contadores acumulativos de vehículos
 int vehicleCount1 = 0;
 int vehicleCount2 = 0;
+
+// Estados previos de sensores para detección de flancos
+bool lastCNY1 = HIGH, lastCNY2 = HIGH, lastCNY3 = HIGH;
+bool lastCNY4 = HIGH, lastCNY5 = HIGH, lastCNY6 = HIGH;
+
+// Variables de sensores ambientales
 int ldr1Value = 0;
 int ldr2Value = 0;
 int co2Value = 0;
 
+// Variables para modo peatonal
+volatile bool solicitudPeatonal = false;
+unsigned long tiempoInicioModoPeatonal = 0;
+bool modoPeatonalActivo = false;
+
+// Timer para resetear contadores
+unsigned long tiempoUltimoReset = 0;
+#define TIEMPO_RESET_CONTADOR 60000 // Resetear cada 60 segundos
+
 // =================================================================
-//  SETUP: Runs once at the beginning
+//  CONFIGURACIÓN: Se ejecuta una vez al inicio
 // =================================================================
 void setup() {
   Serial.begin(115200);
 
-  // --- Initialize LCD ---
+  // --- Inicializar LCD ---
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("System Initializing");
+  lcd.print("Iniciando Sistema...");
   delay(1000);
   lcd.clear();
 
-  // --- Initialize Traffic Lights (Outputs) ---
+  // --- Inicializar Semáforos (Salidas) ---
   pinMode(LR1, OUTPUT);
   pinMode(LY1, OUTPUT);
   pinMode(LG1, OUTPUT);
@@ -80,7 +97,7 @@ void setup() {
   pinMode(LY2, OUTPUT);
   pinMode(LG2, OUTPUT);
 
-  // --- Initialize Sensors (Inputs) ---
+  // --- Inicializar Sensores (Entradas) ---
   pinMode(P1, INPUT_PULLUP);
   pinMode(P2, INPUT_PULLUP);
   pinMode(CNY1, INPUT);
@@ -89,218 +106,309 @@ void setup() {
   pinMode(CNY4, INPUT);
   pinMode(CNY5, INPUT);
   pinMode(CNY6, INPUT);
-  // Analog pins (LDR, CO2) don't need pinMode
+  // Los pines analógicos (LDR, CO2) no necesitan pinMode
 
-  // --- Attach Interrupts for Pedestrian Buttons ---
-  attachInterrupt(digitalPinToInterrupt(P1), handlePedestrianRequest, FALLING);
-  attachInterrupt(digitalPinToInterrupt(P2), handlePedestrianRequest, FALLING);
+  // --- Adjuntar Interrupciones para Botones Peatonales ---
+  attachInterrupt(digitalPinToInterrupt(P1), manejarSolicitudPeatonal, FALLING);
+  attachInterrupt(digitalPinToInterrupt(P2), manejarSolicitudPeatonal, FALLING);
   
-  // Start with all lights red
-  allLightsRed();
+  // Iniciar con todas las luces en rojo
+  todasLucesRojas();
 }
 
 // =================================================================
-//  MAIN LOOP: Runs continuously
+//  BUCLE PRINCIPAL: Se ejecuta continuamente
 // =================================================================
 void loop() {
-  // 1. Read all sensors to get current context
-  readAllSensors();
-
-  // 2. Determine the current state based on context
-  // (Pedestrian state is handled by interrupts)
-  if (currentState != PEDESTRIAN) {
-    determineState();
+  // 1. Leer sensores primero para tener datos actualizados de CO2
+  leerTodosSensores();
+  
+  // 2. Verificar si hay solicitud peatonal (desde interrupción)
+  // IMPORTANTE: Modo EMISION tiene prioridad ABSOLUTA - ni peatonal lo interrumpe
+  if (solicitudPeatonal && estadoActual != PEATONAL && co2Value <= CO2_HIGH_THRESHOLD) {
+    estadoActual = PEATONAL;
+    solicitudPeatonal = false;
+    modoPeatonalActivo = true;
+    tiempoInicioModoPeatonal = millis();
+    todasLucesRojas();
+  } else if (solicitudPeatonal && co2Value > CO2_HIGH_THRESHOLD) {
+    // Si hay solicitud peatonal pero CO2 alto, ignorar y resetear bandera
+    solicitudPeatonal = false;
+    Serial.println("ALERTA: Solicitud peatonal BLOQUEADA por CO2 alto!");
+  }
+  
+  // 3. Manejar modo peatonal con temporizador no bloqueante
+  if (estadoActual == PEATONAL) {
+    if (millis() - tiempoInicioModoPeatonal >= PEDESTRIAN_CROSS_TIME) {
+      parpadearTodasAmarillas(2);
+      estadoActual = NORMAL;
+      modoPeatonalActivo = false;
+    }
+    actualizarPantalla();
+    return; // No ejecutar otros modos mientras peatonal está activo
   }
 
-  // 3. Execute the logic for the current state
-  switch (currentState) {
+  // 4. Determinar el estado actual basado en el contexto
+  determinarEstado();
+
+  // 5. Ejecutar la lógica para el estado actual
+  switch (estadoActual) {
     case NORMAL:
-      runNormalMode();
+      ejecutarModoNormal();
       break;
-    case NIGHT:
-      runNightMode();
+    case NOCTURNO:
+      ejecutarModoNocturno();
       break;
-    case HEAVY_TRAFFIC:
-      runHeavyTrafficMode();
+    case TRAFICO_PESADO:
+      ejecutarModoTraficoPesado();
       break;
-    case PEDESTRIAN:
-      // This state is triggered by an interrupt
-      // The interrupt handler will set the state back to NORMAL when done
+    case EMISION:
+      ejecutarModoEmision();
+      break;
+    case PEATONAL:
+      // Manejado arriba con temporizador no bloqueante
       break;
   }
   
-  // 4. Update the display with current info
-  updateDisplay();
+  // 6. Actualizar la pantalla con la información actual
+  actualizarPantalla();
 }
 
 // =================================================================
-//  State Determination and Sensor Reading
+//  Determinación de Estado y Lectura de Sensores
 // =================================================================
 
-void readAllSensors() {
-  // Read LDR values
+void leerTodosSensores() {
+  // Leer valores de LDR
   ldr1Value = analogRead(LDR1);
   ldr2Value = analogRead(LDR2);
 
-  // Read CO2 sensor
+  // Leer sensor de CO2
   co2Value = analogRead(CO2_PIN);
 
-  // Read vehicle sensors (simple digital read for now)
-  // A more robust implementation would count vehicles over time
-  vehicleCount1 = !digitalRead(CNY1) + !digitalRead(CNY2) + !digitalRead(CNY3);
-  vehicleCount2 = !digitalRead(CNY4) + !digitalRead(CNY5) + !digitalRead(CNY6);
+  // Detectar vehículos con detección de flancos (cada click = +1 vehículo)
+  // Dirección 1
+  bool cny1 = digitalRead(CNY1);
+  bool cny2 = digitalRead(CNY2);
+  bool cny3 = digitalRead(CNY3);
   
-  Serial.print("V1: "); Serial.print(vehicleCount1);
-  Serial.print(" | V2: "); Serial.print(vehicleCount2);
-  Serial.print(" | LDR1: "); Serial.print(ldr1Value);
-  Serial.print(" | LDR2: "); Serial.println(ldr2Value);
-}
-
-void determineState() {
-  // Check for Night Mode first
-  if (ldr1Value < NIGHT_MODE_THRESHOLD && ldr2Value < NIGHT_MODE_THRESHOLD) {
-    currentState = NIGHT;
-  } 
-  // Check for Heavy Traffic
-  else if (abs(vehicleCount1 - vehicleCount2) >= HEAVY_TRAFFIC_DIFF) {
-    currentState = HEAVY_TRAFFIC;
-  } 
-  // Default to Normal Mode
-  else {
-    currentState = NORMAL;
+  // Detectar AMBOS flancos (ascendente y descendente) para funcionar en Wokwi
+  if (lastCNY1 != cny1) { vehicleCount1++; Serial.println("CNY1 detectado!"); }
+  if (lastCNY2 != cny2) { vehicleCount1++; Serial.println("CNY2 detectado!"); }
+  if (lastCNY3 != cny3) { vehicleCount1++; Serial.println("CNY3 detectado!"); }
+  
+  lastCNY1 = cny1;
+  lastCNY2 = cny2;
+  lastCNY3 = cny3;
+  
+  // Dirección 2
+  bool cny4 = digitalRead(CNY4);
+  bool cny5 = digitalRead(CNY5);
+  bool cny6 = digitalRead(CNY6);
+  
+  if (lastCNY4 != cny4) { vehicleCount2++; Serial.println("CNY4 detectado!"); }
+  if (lastCNY5 != cny5) { vehicleCount2++; Serial.println("CNY5 detectado!"); }
+  if (lastCNY6 != cny6) { vehicleCount2++; Serial.println("CNY6 detectado!"); }
+  
+  lastCNY4 = cny4;
+  lastCNY5 = cny5;
+  lastCNY6 = cny6;
+  
+  // Resetear contadores cada minuto
+  if (millis() - tiempoUltimoReset >= TIEMPO_RESET_CONTADOR) {
+    Serial.print("RESET - Total D1: ");
+    Serial.print(vehicleCount1);
+    Serial.print(" | D2: ");
+    Serial.println(vehicleCount2);
+    vehicleCount1 = 0;
+    vehicleCount2 = 0;
+    tiempoUltimoReset = millis();
+  }
+  
+  // Debug en serial
+  static unsigned long lastSerialPrint = 0;
+  if (millis() - lastSerialPrint > 2000) { // Cada 2 segundos
+    Serial.print("Vehiculos D1: "); Serial.print(vehicleCount1);
+    Serial.print(" | D2: "); Serial.print(vehicleCount2);
+    Serial.print(" | Luz: "); Serial.print((ldr1Value + ldr2Value) / 2);
+    Serial.print(" | CO2: "); Serial.println(co2Value);
+    lastSerialPrint = millis();
   }
 }
 
-void updateDisplay() {
+void determinarEstado() {
+  // PRIORIDAD 1: Verificar CO2 Alto (máxima prioridad ambiental)
+  // Este modo NO desaparece hasta que baje el CO2
+  if (co2Value > CO2_HIGH_THRESHOLD) {
+    estadoActual = EMISION;
+  }
+  // PRIORIDAD 2: Verificar Modo Nocturno
+  else if (ldr1Value < NIGHT_MODE_THRESHOLD && ldr2Value < NIGHT_MODE_THRESHOLD) {
+    estadoActual = NOCTURNO;
+  } 
+  // PRIORIDAD 3: Verificar Tráfico Pesado
+  else if (abs(vehicleCount1 - vehicleCount2) >= HEAVY_TRAFFIC_DIFF) {
+    estadoActual = TRAFICO_PESADO;
+  } 
+  // Por defecto Modo Normal
+  else {
+    estadoActual = NORMAL;
+  }
+}
+
+void actualizarPantalla() {
+  static unsigned long ultimaActualizacion = 0;
+  static int ultimoSegundoPeatonal = -1;
+  
+  // Para modo peatonal, solo actualizar cuando cambie el segundo
+  if (estadoActual == PEATONAL) {
+    int segundosRestantes = (PEDESTRIAN_CROSS_TIME - (millis() - tiempoInicioModoPeatonal)) / 1000;
+    if (segundosRestantes == ultimoSegundoPeatonal) {
+      return; // No actualizar si no ha cambiado el segundo
+    }
+    ultimoSegundoPeatonal = segundosRestantes;
+  } else {
+    ultimoSegundoPeatonal = -1;
+    // Para otros modos, actualizar cada 500ms
+    if (millis() - ultimaActualizacion < 500) {
+      return;
+    }
+  }
+  
+  ultimaActualizacion = millis();
   lcd.clear();
   
-  // Line 1: Current Mode
+  // Línea 1: Modo Actual
   lcd.setCursor(0, 0);
-  switch(currentState) {
-    case NORMAL: lcd.print("Mode: NORMAL"); break;
-    case NIGHT: lcd.print("Mode: NOCTURNO"); break;
-    case HEAVY_TRAFFIC: lcd.print("Mode: T. PESADO"); break;
-    case PEDESTRIAN: lcd.print("Mode: PEATONAL"); break;
+  switch(estadoActual) {
+    case NORMAL: lcd.print("Modo: NORMAL"); break;
+    case NOCTURNO: lcd.print("Modo: NOCTURNO"); break;
+    case TRAFICO_PESADO: lcd.print("Modo: T. PESADO"); break;
+    case EMISION: lcd.print("Modo: EMISION CO2"); break;
+    case PEATONAL: 
+      lcd.print("Modo: PEATONAL ");
+      lcd.print(ultimoSegundoPeatonal);
+      lcd.print("s");
+      break;
   }
 
-  // Line 2 & 3: Vehicle and Environment Data
+  // Línea 2: Datos de Vehículos (acumulados)
   lcd.setCursor(0, 1);
   lcd.print("Vehiculos: D1=");
   lcd.print(vehicleCount1);
   lcd.print(" D2=");
   lcd.print(vehicleCount2);
+  lcd.print("  "); // Limpiar caracteres extras
   
+  // Línea 3: Datos ambientales
   lcd.setCursor(0, 2);
   lcd.print("Luz: ");
   lcd.print((ldr1Value + ldr2Value) / 2);
+  lcd.print("  ");
+  
+  // Línea 4: CO2 y tiempo hasta reset
   lcd.setCursor(0, 3);
-  lcd.print("CO2: ");
+  lcd.print("CO2:");
   lcd.print(co2Value);
+  lcd.print(" Reset:");
+  lcd.print((TIEMPO_RESET_CONTADOR - (millis() - tiempoUltimoReset)) / 1000);
+  lcd.print("s  ");
 }
 
 
 // =================================================================
-//  Interrupt Handlers
+//  Manejadores de Interrupción
 // =================================================================
 
-void handlePedestrianRequest() {
-  // Set the state to PEDESTRIAN to interrupt the main loop's flow
-  if (currentState != PEDESTRIAN) {
-    currentState = PEDESTRIAN;
-    runPedestrianMode(); // Execute directly for immediate response
-  }
+void manejarSolicitudPeatonal() {
+  // Solo establecer bandera - NO ejecutar código bloqueante en interrupción
+  solicitudPeatonal = true;
 }
 
 // =================================================================
-//  Operation Modes
+//  Modos de Operación
 // =================================================================
 
-void runNormalMode() {
-  // Standard cycle: 10s Green, 3s Yellow
-  runTrafficCycle(10000, 3000);
+void ejecutarModoNormal() {
+  // Ciclo estándar: 10s Verde, 3s Amarillo
+  ejecutarCicloTrafico(10000, 3000);
 }
 
-void runNightMode() {
-  // Faster cycle: 6s Green, 2s Yellow
-  runTrafficCycle(6000, 2000);
+void ejecutarModoNocturno() {
+  // Ciclo más rápido: 6s Verde, 2s Amarillo
+  ejecutarCicloTrafico(6000, 2000);
 }
 
-void runHeavyTrafficMode() {
-  // Prioritize the direction with more vehicles
+void ejecutarModoTraficoPesado() {
+  // Priorizar la dirección con más vehículos
   if (vehicleCount1 > vehicleCount2) {
-    // Longer green for direction 1
-    runSingleCycle(1, 15000, 3000); // 15s green for TL1
-    runSingleCycle(2, 5000, 3000);  // 5s green for TL2
+    // Verde más largo para dirección 1
+    ejecutarCicloIndividual(1, 15000, 3000); // 15s verde para Semáforo 1
+    ejecutarCicloIndividual(2, 5000, 3000);  // 5s verde para Semáforo 2
   } else {
-    // Longer green for direction 2
-    runSingleCycle(1, 5000, 3000);  // 5s green for TL1
-    runSingleCycle(2, 15000, 3000); // 15s green for TL2
+    // Verde más largo para dirección 2
+    ejecutarCicloIndividual(1, 5000, 3000);  // 5s verde para Semáforo 1
+    ejecutarCicloIndividual(2, 15000, 3000); // 15s verde para Semáforo 2
   }
 }
 
-void runPedestrianMode() {
-  // 1. Turn all traffic lights red
-  allLightsRed();
-  updateDisplay(); // Show "PEDESTRIAN" mode on LCD
-
-  // 2. Wait for pedestrian crossing time
-  delay(PEDESTRIAN_CROSS_TIME);
-
-  // 3. Flash yellow lights to signal return to normal
-  flashAllYellow(3); // Flash 3 times
-
-  // 4. Return to NORMAL state
-  currentState = NORMAL;
+void ejecutarModoEmision() {
+  // Modo Reducción de Emisiones: Verde largo para flujo continuo
+  // Objetivo: Minimizar paradas = menos ralentí = menos CO2
+  // Verde: 20s (muy largo), Amarillo: 2s (corto)
+  ejecutarCicloTrafico(20000, 2000);
 }
 
+// Modo peatonal ahora se maneja en el loop principal sin delays bloqueantes
+
 // =================================================================
-//  Traffic Light Control Helpers
+//  Funciones Auxiliares de Control de Semáforos
 // =================================================================
 
-// Runs a full cycle for both traffic lights
-void runTrafficCycle(int greenTime, int yellowTime) {
-  runSingleCycle(1, greenTime, yellowTime);
-  runSingleCycle(2, greenTime, yellowTime);
+// Ejecuta un ciclo completo para ambos semáforos
+void ejecutarCicloTrafico(int tiempoVerde, int tiempoAmarillo) {
+  ejecutarCicloIndividual(1, tiempoVerde, tiempoAmarillo);
+  ejecutarCicloIndividual(2, tiempoVerde, tiempoAmarillo);
 }
 
-// Runs one phase of a traffic light cycle (Green -> Yellow -> Red)
-void runSingleCycle(int direction, int greenTime, int yellowTime) {
-  if (direction == 1) {
-    // TL1 Green, TL2 Red
+// Ejecuta una fase de un ciclo de semáforo (Verde -> Amarillo -> Rojo)
+void ejecutarCicloIndividual(int direccion, int tiempoVerde, int tiempoAmarillo) {
+  if (direccion == 1) {
+    // Semáforo 1 Verde, Semáforo 2 Rojo
     digitalWrite(LG1, HIGH);
     digitalWrite(LY1, LOW);
     digitalWrite(LR1, LOW);
     digitalWrite(LR2, HIGH);
     digitalWrite(LY2, LOW);
     digitalWrite(LG2, LOW);
-    if (interruptSafeDelay(greenTime)) return; // Check for interrupt
+    if (esperaSeguraInterrupcion(tiempoVerde)) return; // Verificar interrupción
 
-    // TL1 Yellow, TL2 Red
+    // Semáforo 1 Amarillo, Semáforo 2 Rojo
     digitalWrite(LG1, LOW);
     digitalWrite(LY1, HIGH);
-    if (interruptSafeDelay(yellowTime)) return; // Check for interrupt
+    if (esperaSeguraInterrupcion(tiempoAmarillo)) return; // Verificar interrupción
 
-  } else { // direction == 2
-    // TL2 Green, TL1 Red
+  } else { // direccion == 2
+    // Semáforo 2 Verde, Semáforo 1 Rojo
     digitalWrite(LR1, HIGH);
     digitalWrite(LY1, LOW);
     digitalWrite(LG1, LOW);
     digitalWrite(LG2, HIGH);
     digitalWrite(LY2, LOW);
     digitalWrite(LR2, LOW);
-    if (interruptSafeDelay(greenTime)) return; // Check for interrupt
+    if (esperaSeguraInterrupcion(tiempoVerde)) return; // Verificar interrupción
 
-    // TL2 Yellow, TL1 Red
+    // Semáforo 2 Amarillo, Semáforo 1 Rojo
     digitalWrite(LG2, LOW);
     digitalWrite(LY2, HIGH);
-    if (interruptSafeDelay(yellowTime)) return; // Check for interrupt
+    if (esperaSeguraInterrupcion(tiempoAmarillo)) return; // Verificar interrupción
   }
   
-  allLightsRed();
-  delay(1000); // All-red delay for safety
+  todasLucesRojas();
+  delay(1000); // Espera todo-rojo para seguridad
 }
 
-void allLightsRed() {
+void todasLucesRojas() {
   digitalWrite(LG1, LOW);
   digitalWrite(LY1, LOW);
   digitalWrite(LR1, HIGH);
@@ -309,9 +417,9 @@ void allLightsRed() {
   digitalWrite(LR2, HIGH);
 }
 
-void flashAllYellow(int count) {
-  allLightsOff();
-  for (int i = 0; i < count; i++) {
+void parpadearTodasAmarillas(int veces) {
+  todasLucesApagadas();
+  for (int i = 0; i < veces; i++) {
     digitalWrite(LY1, HIGH);
     digitalWrite(LY2, HIGH);
     delay(500);
@@ -321,7 +429,7 @@ void flashAllYellow(int count) {
   }
 }
 
-void allLightsOff() {
+void todasLucesApagadas() {
     digitalWrite(LR1, LOW);
     digitalWrite(LY1, LOW);
     digitalWrite(LG1, LOW);
@@ -330,15 +438,17 @@ void allLightsOff() {
     digitalWrite(LG2, LOW);
 }
 
-// Custom delay function that checks for pedestrian interrupt
-// Returns true if an interrupt occurred, false otherwise
-bool interruptSafeDelay(int ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    if (currentState == PEDESTRIAN) {
-      return true; // Abort delay if pedestrian button was pressed
+// Función de espera personalizada que verifica interrupciones peatonales
+// Retorna verdadero si ocurrió una interrupción, falso en caso contrario
+// NOTA: Modo EMISION no puede ser interrumpido ni por peatonales
+bool esperaSeguraInterrupcion(int ms) {
+  unsigned long inicio = millis();
+  while (millis() - inicio < ms) {
+    // Solo permitir interrupción peatonal si NO estamos en modo EMISION
+    if (estadoActual == PEATONAL && co2Value <= CO2_HIGH_THRESHOLD) {
+      return true; // Abortar espera si se presionó botón peatonal
     }
-    delay(10); // Small delay to prevent busy-waiting
+    delay(10); // Pequeña espera para prevenir espera ocupada
   }
   return false;
 }

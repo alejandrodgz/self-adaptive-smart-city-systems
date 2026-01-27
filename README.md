@@ -1,55 +1,112 @@
-# Self-Adaptive Smart City Traffic System
+# Sistema de Tráfico Auto-Adaptativo para Ciudad Inteligente
 
-This repository contains the source code and documentation for a self-adaptive smart city traffic system. The project simulates an intelligent urban intersection that dynamically adapts its traffic light cycles based on real-time data from various sensors.
+Este repositorio contiene el código fuente y documentación para un sistema de control de tráfico auto-adaptativo para ciudades inteligentes. El proyecto simula una intersección urbana inteligente que adapta dinámicamente sus ciclos de semáforos basándose en datos en tiempo real de varios sensores.
 
-## 🚀 Overview
+## 🚀 Descripción General
 
-The primary goal of this project is to create a traffic control system that is context-aware and can adjust its behavior to optimize traffic flow, prioritize pedestrian safety, and respond to environmental conditions. This simulation is built using an ESP32-S3 microcontroller and is designed to be a foundational step towards more complex, fully autonomous urban infrastructure.
+El objetivo principal de este proyecto es crear un sistema de control de tráfico consciente del contexto que pueda ajustar su comportamiento para optimizar el flujo vehicular, priorizar la seguridad peatonal y responder a condiciones ambientales. Esta simulación está construida usando un microcontrolador ESP32-S3 y está diseñada como un paso fundamental hacia infraestructura urbana autónoma más compleja.
 
-This first generation of the system is a **"low-level" self-adaptive system**, which means it operates with a closed-loop control mechanism and adjusts its setpoints based on sensor inputs. It does not yet have the capability to learn from past experiences or make structural changes to its logic.
+Esta primera generación del sistema es un **sistema auto-adaptativo de "bajo nivel"**, lo que significa que opera con un mecanismo de control de lazo cerrado y ajusta sus parámetros basándose en las lecturas de sensores. Aún no tiene la capacidad de aprender de experiencias pasadas ni hacer cambios estructurales a su lógica.
 
-## ✨ Features (Generation 1)
+## ✨ Características (Generación 1)
 
-- **Context-Aware Control**: The system uses sensors to understand its environment and make decisions.
-- **Multiple Operation Modes**: It can switch between different modes to handle various scenarios like nighttime, heavy traffic, and pedestrian crossings.
-- **Dynamic Setpoint Adjustment**: Traffic light timings are not fixed; they are adjusted automatically based on the current operation mode.
-- **Real-time Monitoring**: A 20x4 LCD provides real-time feedback on the system's status, including the current mode, traffic light timers, vehicle counts, and air quality.
+- **Control Consciente del Contexto**: El sistema usa sensores para entender su entorno y tomar decisiones.
+- **Múltiples Modos de Operación**: Puede cambiar entre diferentes modos para manejar varios escenarios como horario nocturno, tráfico pesado, emisiones altas de CO2 y cruces peatonales.
+- **Ajuste Dinámico de Parámetros**: Los tiempos de los semáforos no son fijos; se ajustan automáticamente según el modo de operación actual.
+- **Monitoreo en Tiempo Real**: Una pantalla LCD de 20x4 proporciona retroalimentación en tiempo real sobre el estado del sistema, incluyendo modo actual, estado de semáforos, conteo de vehículos y calidad del aire.
+- **Arquitectura No Bloqueante**: Implementa una máquina de estados que permite lectura constante de sensores y respuesta inmediata a cambios de condiciones.
 
-## 🛠️ System Components
+## 🛠️ Componentes del Sistema
 
 ### Hardware
-- **Microcontroller**: ESP32-S3 DevKit
-- **Traffic Lights**: 2 sets of Red, Yellow, and Green LEDs to simulate an intersection.
-- **Vehicle Sensors**: 6 x CNY70 infrared sensors to detect and count vehicles in two directions.
-- **Pedestrian Buttons**: 2 x push buttons for pedestrians to request a crossing signal.
-- **Environmental Sensors**:
-  - 2 x Light Dependent Resistors (LDRs) to detect ambient light levels.
-  - 1 x CO2 sensor to monitor air quality.
-- **Display**: 1 x 20x4 I2C LCD.
+- **Microcontrolador**: ESP32-S3 DevKit
+- **Semáforos**: 2 conjuntos de LEDs Rojo, Amarillo y Verde para simular una intersección
+- **Sensores de Vehículos**: 6 sensores infrarrojos CNY70 para detectar y contar vehículos en dos direcciones (3 por dirección)
+- **Botones Peatonales**: 2 pulsadores para que los peatones soliciten señal de cruce
+- **Sensores Ambientales**:
+  - 2 Fotorresistencias (LDR) para detectar niveles de luz ambiente
+  - 1 Sensor de CO2 para monitorear calidad del aire
+- **Pantalla**: 1 LCD I2C de 20x4 caracteres
 
-## ⚙️ Operating Modes
+## ⚙️ Modos de Operación
 
-The system currently supports four distinct operating modes:
+El sistema soporta **cinco modos distintos de operación** con prioridades jerárquicas:
 
-1.  **NORMAL MODE** (Default)
-    - Standard, balanced traffic light cycle for both directions.
-    - Green Light: 10 seconds, Yellow Light: 3 seconds.
+### 1. **MODO NORMAL** (Por Defecto)
+- Ciclo de tráfico estándar y balanceado para ambas direcciones
+- **Luz Verde**: 10 segundos
+- **Luz Amarilla**: 3 segundos
+- **Transición Todo-Rojo**: 1 segundo (seguridad)
 
-2.  **NIGHT MODE**
-    - Activated when low ambient light is detected by both LDR sensors.
-    - Features faster cycles with reduced wait times to improve efficiency during low-traffic hours.
-    - Green Light: 6 seconds, Yellow Light: 2 seconds.
+### 2. **MODO NOCTURNO** (Prioridad 2)
+- **Activación**: Cuando ambos sensores LDR detectan poca luz ambiente (< 300)
+- Ciclos más rápidos para mejorar eficiencia durante horas de bajo tráfico
+- **Luz Verde**: 6 segundos
+- **Luz Amarilla**: 2 segundos
 
-3.  **HEAVY TRAFFIC MODE**
-    - Triggered when a significant difference in vehicle count is detected between the two directions.
-    - The system extends the green light duration for the more congested direction (15s) while shortening it for the other (5s).
+### 3. **MODO TRÁFICO PESADO** (Prioridad 3)
+- **Activación**: Cuando la diferencia de vehículos entre direcciones es ≥ 3
+- El sistema extiende el tiempo de luz verde para la dirección más congestionada
+- **Dirección Congestionada**: Verde 15s, Amarillo 3s
+- **Dirección Menos Congestionada**: Verde 5s, Amarillo 3s
+- Los contadores se resetean cada 60 segundos para reajuste dinámico
 
-4.  **PEDESTRIAN PRIORITY MODE**
-    - Activated immediately when a pedestrian presses a crossing button.
-    - All vehicle traffic is stopped (all lights turn red) for 15 seconds to allow safe pedestrian crossing.
+### 4. **MODO PEATONAL** (Activado por Solicitud)
+- **Activación**: Cuando un peatón presiona cualquier botón de cruce
+- **Bloqueo**: No se activa si hay alerta de CO2 alto (prioridad ambiental)
+- Todos los semáforos vehiculares se ponen en rojo durante **15 segundos**
+- Cuenta regresiva visible en pantalla LCD
+- Parpadeo amarillo al finalizar (2 segundos) antes de retornar al ciclo normal
+- Respuesta inmediata mediante sistema de interrupciones
 
-## 💻 How to Use
+### 5. **MODO EMISIÓN CO2** (Prioridad 1 - Máxima)
+- **Activación**: Cuando el sensor de CO2 detecta niveles altos (> 600)
+- **Objetivo**: Minimizar emisiones vehiculares reduciendo paradas (menos ralentí = menos CO2)
+- **Luz Verde**: 20 segundos (muy largo para flujo continuo)
+- **Luz Amarilla**: 2 segundos (mínimo)
+- Este modo tiene **prioridad absoluta** y no puede ser interrumpido ni por solicitudes peatonales
 
-The core logic is contained in the `gen1_traffic_control.ino` file. This file can be compiled and uploaded to an ESP32-S3 board that is connected to the hardware components as defined by the pin layout in the code.
+## 🏗️ Arquitectura del Sistema
 
-The simulation can also be run using a virtual environment like Wokwi, for which a `wokwi.toml` and `diagram.json` are provided.
+### Máquina de Estados del Semáforo
+El sistema implementa una máquina de estados no bloqueante con 6 fases:
+1. **FASE_TL1_VERDE**: Semáforo 1 en verde, Semáforo 2 en rojo
+2. **FASE_TL1_AMARILLO**: Semáforo 1 en amarillo, Semáforo 2 en rojo
+3. **FASE_TL1_ROJO**: Transición todo rojo (1 segundo)
+4. **FASE_TL2_VERDE**: Semáforo 2 en verde, Semáforo 1 en rojo
+5. **FASE_TL2_AMARILLO**: Semáforo 2 en amarillo, Semáforo 1 en rojo
+6. **FASE_TL2_ROJO**: Transición todo rojo (1 segundo)
+
+### Ciclo Principal (Loop)
+1. **Lectura de Sensores** (cada 50ms): Monitoreo constante de todos los sensores
+2. **Procesamiento de Solicitudes Peatonales**: Sistema de interrupciones para respuesta inmediata
+3. **Determinación de Modo**: Evaluación de prioridades y cambio de modo si es necesario
+4. **Ejecución de Máquina de Estados**: Control de semáforos según modo activo
+5. **Actualización de Pantalla** (cada 2 segundos): Información visual del sistema
+6. **Reset de Contadores** (cada 60 segundos): Reajuste para adaptación continua
+
+## 📊 Información en Pantalla LCD
+
+La pantalla muestra información en 4 líneas:
+- **Línea 1**: Modo de operación actual
+- **Línea 2**: Conteo de vehículos por dirección (D1 y D2)
+- **Línea 3**: Nivel de luz ambiente y CO2
+- **Línea 4**: Estado actual de los semáforos (TL1 y TL2)
+
+## 💻 Cómo Usar
+
+### Versión Original (Bloqueante)
+El archivo `gen1_traffic_control.ino` contiene la implementación original con delays bloqueantes.
+
+### Versión Refactorizada (Recomendada)
+El archivo `gen1_traffic_control_refactored.ino` contiene la versión optimizada con:
+- Arquitectura no bloqueante
+- Máquina de estados explícita
+- Mejor respuesta a cambios de contexto
+- Lectura continua de sensores
+
+### Compilación y Carga
+El código puede ser compilado y cargado a una placa ESP32-S3 conectada a los componentes de hardware según el diseño de pines definido en el código.
+
+### Simulación en Wokwi
+La simulación también puede ejecutarse en el entorno virtual Wokwi, para lo cual se proporcionan los archivos `wokwi.toml` y `diagram.json`.

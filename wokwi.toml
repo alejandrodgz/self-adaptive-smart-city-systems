@@ -1,5 +1,5 @@
 [wokwi]
 version = 1
-firmware = 'gen_1_city.bin'
-elf = 'gen_1_city.elf'
+firmware = 'gen_1_city.ino.bin'
+elf = 'gen_1_city.ino.elf'
 rfc2217ServerPort = 4000
