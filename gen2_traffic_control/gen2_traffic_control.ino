@@ -12,9 +12,9 @@
 // =================================================================
 //  CONFIGURACIÓN WiFi - MODIFICAR ESTOS VALORES
 // =================================================================
-const char* WIFI_SSID = "S23";        // Nombre de tu red WiFi
-const char* WIFI_PASSWORD = "tatianahoyos";     // Contraseña WiFi
-const char* SERVER_URL = "http://10.65.229.75:5000/api/traffic";  // IP de tu PC
+const char* WIFI_SSID = "SOMOS GARCIA-2.4G";        // Nombre de tu red WiFi
+const char* WIFI_PASSWORD = "1128456232";     // Contraseña WiFi
+const char* SERVER_URL = "http://192.168.78.103:5000/api/traffic";  // IP de tu PC
 
 // Intervalo de envío de datos (ms)
 #define SEND_INTERVAL 5000
@@ -45,7 +45,7 @@ const char* SERVER_URL = "http://10.65.229.75:5000/api/traffic";  // IP de tu PC
 #define NIGHT_MODE_THRESHOLD 300
 #define HEAVY_TRAFFIC_DIFF 3
 #define PEDESTRIAN_CROSS_TIME 15000
-#define CO2_HIGH_THRESHOLD 600
+#define CO2_HIGH_THRESHOLD 400
 #define TIEMPO_RESET_CONTADOR 60000
 
 // -- Pantalla LCD --
@@ -254,8 +254,10 @@ void procesarComandoServidor(String response) {
   
   // Ejecutar el comando
   if (comando == "PEATONAL") {
+    // Solo marcar la solicitud, el loop lo activará correctamente
     solicitudPeatonal = true;
-    Serial.println(">>> Activando modo PEATONAL desde servidor");
+    Serial.println(">>> Solicitud PEATONAL desde servidor");
+    return; // Salir sin delay
   }
   else if (comando == "NORMAL") {
     estadoActual = NORMAL;
@@ -276,7 +278,7 @@ void procesarComandoServidor(String response) {
     Serial.println(">>> Forzando modo NOCTURNO desde servidor (30s)");
   }
   
-  // Mostrar en LCD que se recibió comando
+  // Mostrar en LCD que se recibió comando (solo para NORMAL y NOCTURNO)
   lcd.clear();
   lcd.print("CMD Servidor:");
   lcd.setCursor(0, 1);
@@ -325,9 +327,13 @@ void loop() {
   }
   
   // ===== ENVIAR DATOS AL SERVIDOR (cada 5 segundos) =====
-  if (tiempoActual - ultimoEnvioServidor >= SEND_INTERVAL) {
+  // NO enviar durante modo peatonal para no interrumpir el ciclo
+  if (tiempoActual - ultimoEnvioServidor >= SEND_INTERVAL && estadoActual != PEATONAL) {
     enviarDatosServidor();
     ultimoEnvioServidor = tiempoActual;
+    // IMPORTANTE: Recalcular tiempo después de operación HTTP lenta
+    // Esto evita underflow en tiempoTranscurrido del modo peatonal
+    tiempoActual = millis();
   }
   
   // ===== VERIFICAR WiFi (cada 30 segundos) =====
