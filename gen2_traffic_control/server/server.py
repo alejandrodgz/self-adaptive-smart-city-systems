@@ -22,6 +22,236 @@ historial = []
 # Comando pendiente para enviar al ESP32
 comando_pendiente = None
 
+# =================================================================
+#  SISTEMA ADAPTATIVO INTELIGENTE - "CEREBRO" DEL TRÁFICO
+# =================================================================
+modo_automatico = False  # Toggle para activar/desactivar
+ultimo_comando_auto = None
+razon_comando = ""
+historial_decisiones = []
+
+# Setpoints actuales del ESP32 (se actualizan con cada mensaje)
+setpoints_actuales = {
+    'sp_verde_normal': 10000,
+    'sp_peatonal': 15000,
+    'sp_verde_pesado_max': 15000,
+    'sp_verde_pesado_min': 5000
+}
+
+# Historial para análisis de patrones
+historial_peatonal = []  # Timestamps de activaciones peatonales
+historial_desbalance = []  # Últimos ratios D1/D2
+
+# Configuración del sistema adaptativo
+CONFIG_ADAPTATIVO = {
+    # Porcentajes de ajuste (escalado y desescalado)
+    'porcentaje_ajuste': 0.15,            # 15% de incremento/decremento
+    
+    # Regla Peatonal
+    'umbral_peatonal_alto': 3,            # ≥3 activaciones = aumentar
+    'umbral_peatonal_bajo': 1,            # ≤1 activación = reducir
+    'ventana_peatonal_minutos': 30,       # Ventana de tiempo
+    'peatonal_base_ms': 15000,            # Valor base (para volver)
+    'peatonal_max_ms': 25000,             # Máximo tiempo peatonal
+    'peatonal_min_ms': 10000,             # Mínimo tiempo peatonal
+    
+    # Regla Desbalance
+    'umbral_desbalance_alto': 0.70,       # >70% = desbalance fuerte
+    'umbral_desbalance_bajo': 0.55,       # <55% = equilibrado (desescalar)
+    'registros_desbalance': 10,           # Registros para evaluar (reducido para pruebas)
+    'verde_base_ms': 15000,               # Valor base
+    'verde_max_ms': 22000,                # Máximo tiempo verde
+    'verde_min_ms': 10000,                # Mínimo tiempo verde
+    
+    # Control de frecuencia de ajustes
+    'cooldown_ajuste_segundos': 60        # Mínimo 60s entre ajustes
+}
+
+# Último ajuste realizado (para cooldown)
+ultimo_ajuste_timestamp = None
+
+def actualizar_setpoints(data):
+    """Actualiza los setpoints actuales desde los datos del ESP32"""
+    global setpoints_actuales
+    if 'sp_verde_normal' in data:
+        setpoints_actuales['sp_verde_normal'] = data['sp_verde_normal']
+    if 'sp_peatonal' in data:
+        setpoints_actuales['sp_peatonal'] = data['sp_peatonal']
+    if 'sp_verde_pesado_max' in data:
+        setpoints_actuales['sp_verde_pesado_max'] = data['sp_verde_pesado_max']
+    if 'sp_verde_pesado_min' in data:
+        setpoints_actuales['sp_verde_pesado_min'] = data['sp_verde_pesado_min']
+
+def registrar_activacion_peatonal(data):
+    """Registra cuando se activa el modo peatonal"""
+    global historial_peatonal
+    contador = data.get('contador_peatonal', 0)
+    
+    # Si el contador aumentó, registrar la activación
+    if historial_peatonal:
+        ultimo = historial_peatonal[-1]
+        if contador > ultimo.get('contador', 0):
+            historial_peatonal.append({
+                'timestamp': datetime.now(),
+                'contador': contador
+            })
+    elif contador > 0:
+        historial_peatonal.append({
+            'timestamp': datetime.now(),
+            'contador': contador
+        })
+    
+    # Mantener solo últimas 50 activaciones
+    if len(historial_peatonal) > 50:
+        historial_peatonal.pop(0)
+
+def registrar_desbalance(data):
+    """Registra el ratio de tráfico para análisis de desbalance"""
+    global historial_desbalance
+    d1 = data.get('vehiculos_dir1', 0)
+    d2 = data.get('vehiculos_dir2', 0)
+    total = d1 + d2
+    
+    if total > 0:
+        ratio_d1 = d1 / total
+        historial_desbalance.append({
+            'timestamp': datetime.now(),
+            'ratio_d1': ratio_d1,
+            'd1': d1,
+            'd2': d2
+        })
+        print(f"📊 Registrado: D1={d1}, D2={d2}, Ratio D1={ratio_d1*100:.1f}% | Historial: {len(historial_desbalance)} registros")
+    else:
+        print(f"⚠️ Sin vehículos: D1={d1}, D2={d2}")
+    
+    # Mantener solo últimos N registros
+    max_registros = CONFIG_ADAPTATIVO['registros_desbalance']
+    if len(historial_desbalance) > max_registros:
+        historial_desbalance.pop(0)
+
+def analizar_y_decidir(data):
+    """
+    🧠 CEREBRO ADAPTATIVO: Analiza patrones históricos y ajusta setpoints.
+    Usa porcentajes para escalar y desescalar según las condiciones.
+    """
+    global ultimo_comando_auto, razon_comando, historial_decisiones, ultimo_ajuste_timestamp
+    
+    if not modo_automatico:
+        return None, None
+    
+    # Actualizar datos
+    actualizar_setpoints(data)
+    registrar_activacion_peatonal(data)
+    registrar_desbalance(data)
+    
+    # Verificar cooldown entre ajustes
+    ahora = datetime.now()
+    if ultimo_ajuste_timestamp:
+        segundos_desde_ajuste = (ahora - ultimo_ajuste_timestamp).total_seconds()
+        if segundos_desde_ajuste < CONFIG_ADAPTATIVO['cooldown_ajuste_segundos']:
+            return None, None
+    
+    comando = None
+    razon = ""
+    porcentaje = CONFIG_ADAPTATIVO['porcentaje_ajuste']
+    
+    # =========================================================
+    # REGLA 1: Ajuste de tiempo PEATONAL (escalar/desescalar)
+    # =========================================================
+    ventana_minutos = CONFIG_ADAPTATIVO['ventana_peatonal_minutos']
+    
+    activaciones_recientes = [
+        h for h in historial_peatonal 
+        if (ahora - h['timestamp']).total_seconds() < ventana_minutos * 60
+    ]
+    num_activaciones = len(activaciones_recientes)
+    
+    sp_peatonal = setpoints_actuales['sp_peatonal']
+    
+    # ESCALAR: Muchas activaciones → aumentar tiempo
+    if num_activaciones >= CONFIG_ADAPTATIVO['umbral_peatonal_alto']:
+        if sp_peatonal < CONFIG_ADAPTATIVO['peatonal_max_ms']:
+            incremento = int(sp_peatonal * porcentaje)
+            nuevo_valor = min(sp_peatonal + incremento, CONFIG_ADAPTATIVO['peatonal_max_ms'])
+            comando = f"AJUSTAR:SP_PEATONAL:{nuevo_valor}"
+            razon = f"📈 Peatonal frecuente ({num_activaciones} en {ventana_minutos}min) → +{porcentaje*100:.0f}%: {sp_peatonal/1000:.1f}s → {nuevo_valor/1000:.1f}s"
+    
+    # DESESCALAR: Pocas activaciones → reducir tiempo (volver al base)
+    elif num_activaciones <= CONFIG_ADAPTATIVO['umbral_peatonal_bajo']:
+        if sp_peatonal > CONFIG_ADAPTATIVO['peatonal_min_ms']:
+            decremento = int(sp_peatonal * porcentaje)
+            nuevo_valor = max(sp_peatonal - decremento, CONFIG_ADAPTATIVO['peatonal_min_ms'])
+            if nuevo_valor < sp_peatonal:  # Solo si realmente cambia
+                comando = f"AJUSTAR:SP_PEATONAL:{nuevo_valor}"
+                razon = f"📉 Peatonal bajo ({num_activaciones} en {ventana_minutos}min) → -{porcentaje*100:.0f}%: {sp_peatonal/1000:.1f}s → {nuevo_valor/1000:.1f}s"
+    
+    # =========================================================
+    # REGLA 2: Ajuste de tiempo VERDE (escalar/desescalar)
+    # =========================================================
+    registros_necesarios = CONFIG_ADAPTATIVO['registros_desbalance']
+    registros_actuales = len(historial_desbalance)
+    
+    print(f"🔍 Desbalance: {registros_actuales}/{registros_necesarios} registros")
+    
+    if not comando and registros_actuales >= registros_necesarios:
+        promedio_ratio_d1 = sum(h['ratio_d1'] for h in historial_desbalance) / len(historial_desbalance)
+        
+        sp_verde = setpoints_actuales['sp_verde_pesado_max']
+        umbral_alto = CONFIG_ADAPTATIVO['umbral_desbalance_alto']
+        umbral_bajo = CONFIG_ADAPTATIVO['umbral_desbalance_bajo']
+        
+        print(f"🔍 Ratio D1: {promedio_ratio_d1*100:.1f}% | Umbral alto: >{umbral_alto*100:.0f}% | SP Verde: {sp_verde}ms")
+        
+        # ESCALAR: Desbalance fuerte → aumentar tiempo verde
+        # D1 domina (>70%) o D2 domina (D1 < 30%)
+        if promedio_ratio_d1 > umbral_alto or promedio_ratio_d1 < (1 - umbral_alto):
+            direccion = "D1" if promedio_ratio_d1 > 0.5 else "D2"
+            pct_dominante = max(promedio_ratio_d1, 1 - promedio_ratio_d1) * 100
+            
+            print(f"⚠️ DESBALANCE DETECTADO: {direccion} domina con {pct_dominante:.0f}%")
+            
+            if sp_verde < CONFIG_ADAPTATIVO['verde_max_ms']:
+                incremento = int(sp_verde * porcentaje)
+                nuevo_valor = min(sp_verde + incremento, CONFIG_ADAPTATIVO['verde_max_ms'])
+                comando = f"AJUSTAR:SP_VERDE_PESADO_MAX:{nuevo_valor}"
+                razon = f"📈 {direccion} domina ({pct_dominante:.0f}%) → +{porcentaje*100:.0f}%: {sp_verde/1000:.1f}s → {nuevo_valor/1000:.1f}s"
+                print(f"✅ COMANDO GENERADO: {comando}")
+            else:
+                print(f"⚠️ No se ajusta: ya en máximo ({sp_verde}ms >= {CONFIG_ADAPTATIVO['verde_max_ms']}ms)")
+        
+        # DESESCALAR: Tráfico equilibrado (entre 45% y 55%) → reducir tiempo verde
+        elif (1 - umbral_bajo) <= promedio_ratio_d1 <= umbral_bajo:
+            print(f"📊 Tráfico equilibrado: {promedio_ratio_d1*100:.1f}%")
+            if sp_verde > CONFIG_ADAPTATIVO['verde_min_ms']:
+                decremento = int(sp_verde * porcentaje)
+                nuevo_valor = max(sp_verde - decremento, CONFIG_ADAPTATIVO['verde_min_ms'])
+                if nuevo_valor < sp_verde:
+                    comando = f"AJUSTAR:SP_VERDE_PESADO_MAX:{nuevo_valor}"
+                    razon = f"📉 Tráfico equilibrado ({promedio_ratio_d1*100:.0f}%/{(1-promedio_ratio_d1)*100:.0f}%) → -{porcentaje*100:.0f}%: {sp_verde/1000:.1f}s → {nuevo_valor/1000:.1f}s"
+                    print(f"✅ COMANDO GENERADO: {comando}")
+        else:
+            print(f"📊 Sin acción: ratio {promedio_ratio_d1*100:.1f}% no cumple umbrales")
+    
+    # Evitar enviar el mismo comando repetidamente
+    if comando and comando == ultimo_comando_auto:
+        return None, None
+    
+    if comando:
+        ultimo_comando_auto = comando
+        razon_comando = razon
+        ultimo_ajuste_timestamp = ahora  # Registrar para cooldown
+        
+        # Guardar en historial de decisiones
+        historial_decisiones.append({
+            'timestamp': ahora.strftime('%H:%M:%S'),
+            'comando': comando.split(':')[0] + ':' + comando.split(':')[1],
+            'razon': razon
+        })
+        if len(historial_decisiones) > 20:
+            historial_decisiones.pop(0)
+    
+    return comando, razon
+
 # Archivo CSV para historial
 CSV_FILE = "traffic_data.csv"
 CSV_COLUMNS = ["timestamp", "estado", "fase", "vehiculos_dir1", "vehiculos_dir2", "ldr1", "ldr2", "co2", "wifi_rssi"]
@@ -145,6 +375,7 @@ def index():
     <head>
         <title>Sistema de Tráfico Gen2</title>
         <meta http-equiv="refresh" content="5">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; background: #1a1a2e; color: #eee; }
             .container { max-width: 800px; margin: 0 auto; }
@@ -166,7 +397,12 @@ def index():
             .btn-blue { background: #0066cc; color: white; }
             .btn-green { background: #00aa44; color: white; }
             .btn-yellow { background: #cc8800; color: white; }
+            .btn-red { background: #cc3333; color: white; }
+            .btn-purple { background: #8844cc; color: white; }
             .btn:hover { opacity: 0.8; }
+            .auto-panel { background: linear-gradient(135deg, #1a1a4e, #2a2a6e); border: 2px solid #6644aa; }
+            .auto-active { border-color: #00ff88; box-shadow: 0 0 20px rgba(0,255,136,0.3); }
+            .decision-item { padding: 8px; background: #0a1628; margin: 5px 0; border-radius: 5px; font-size: 13px; border-left: 3px solid #8844cc; }
         </style>
     </head>
     <body>
@@ -246,6 +482,90 @@ def index():
         html += f'<p style="color: #ffaa00;">⏳ Comando pendiente: {comando_pendiente}</p>'
     html += "</div>"
     
+    # Panel del Sistema Adaptativo Inteligente
+    auto_class = "auto-panel auto-active" if modo_automatico else "auto-panel"
+    auto_estado = "✅ ACTIVO" if modo_automatico else "❌ INACTIVO"
+    auto_color = "#00ff88" if modo_automatico else "#ff4444"
+    btn_texto = "🚫 Desactivar" if modo_automatico else "🧠 Activar"
+    btn_class = "btn btn-red" if modo_automatico else "btn btn-purple"
+    
+    # Información de setpoints y patrones
+    activaciones_recientes = len([
+        h for h in historial_peatonal 
+        if (datetime.now() - h['timestamp']).total_seconds() < CONFIG_ADAPTATIVO['ventana_peatonal_minutos'] * 60
+    ]) if historial_peatonal else 0
+    
+    promedio_ratio = 0.5
+    if historial_desbalance:
+        promedio_ratio = sum(h['ratio_d1'] for h in historial_desbalance) / len(historial_desbalance)
+    
+    html += f"""
+        <div class="card {auto_class}">
+            <h2>🧠 Sistema Adaptativo Inteligente</h2>
+            <div style="display: flex; align-items: center; gap: 20px; margin-bottom: 15px;">
+                <div>
+                    <span style="font-size: 24px; font-weight: bold; color: {auto_color};">{auto_estado}</span>
+                </div>
+                <form action="/api/auto" method="POST">
+                    <button type="submit" class="{btn_class}">{btn_texto}</button>
+                </form>
+            </div>
+            
+            <!-- Setpoints Actuales -->
+            <div style="background: #0a1628; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                <strong>⚙️ Setpoints Actuales del ESP32:</strong>
+                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px;">
+                    <div style="background: #0f3460; padding: 10px; border-radius: 5px;">
+                        <span style="color: #888;">Verde Normal:</span>
+                        <span style="color: #00d4ff; font-weight: bold;"> {setpoints_actuales['sp_verde_normal']/1000:.1f}s</span>
+                    </div>
+                    <div style="background: #0f3460; padding: 10px; border-radius: 5px;">
+                        <span style="color: #888;">Tiempo Peatonal:</span>
+                        <span style="color: #00d4ff; font-weight: bold;"> {setpoints_actuales['sp_peatonal']/1000:.1f}s</span>
+                    </div>
+                    <div style="background: #0f3460; padding: 10px; border-radius: 5px;">
+                        <span style="color: #888;">Verde Máx (Pesado):</span>
+                        <span style="color: #00d4ff; font-weight: bold;"> {setpoints_actuales['sp_verde_pesado_max']/1000:.1f}s</span>
+                    </div>
+                    <div style="background: #0f3460; padding: 10px; border-radius: 5px;">
+                        <span style="color: #888;">Verde Mín (Pesado):</span>
+                        <span style="color: #00d4ff; font-weight: bold;"> {setpoints_actuales['sp_verde_pesado_min']/1000:.1f}s</span>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Reglas Adaptativas -->
+            <div style="background: #0a1628; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                <strong>📖 Reglas de Adaptación (±{CONFIG_ADAPTATIVO['porcentaje_ajuste']*100:.0f}%):</strong>
+                <ul style="margin: 10px 0; padding-left: 20px; font-size: 14px;">
+                    <li>📈 <strong>Peatonal frecuente</strong> (≥{CONFIG_ADAPTATIVO['umbral_peatonal_alto']} en {CONFIG_ADAPTATIVO['ventana_peatonal_minutos']}min) → <span style="color:#00ff88;">+{CONFIG_ADAPTATIVO['porcentaje_ajuste']*100:.0f}%</span></li>
+                    <li>📉 <strong>Peatonal bajo</strong> (≤{CONFIG_ADAPTATIVO['umbral_peatonal_bajo']} en {CONFIG_ADAPTATIVO['ventana_peatonal_minutos']}min) → <span style="color:#ff6666;">-{CONFIG_ADAPTATIVO['porcentaje_ajuste']*100:.0f}%</span></li>
+                    <li>📈 <strong>Desbalance</strong> (&gt;{CONFIG_ADAPTATIVO['umbral_desbalance_alto']*100:.0f}% una dir) → <span style="color:#00ff88;">+{CONFIG_ADAPTATIVO['porcentaje_ajuste']*100:.0f}%</span> verde</li>
+                    <li>📉 <strong>Equilibrado</strong> ({CONFIG_ADAPTATIVO['umbral_desbalance_bajo']*100:.0f}%-{(1-CONFIG_ADAPTATIVO['umbral_desbalance_bajo'])*100:.0f}%) → <span style="color:#ff6666;">-{CONFIG_ADAPTATIVO['porcentaje_ajuste']*100:.0f}%</span> verde</li>
+                </ul>
+                <div style="font-size: 12px; color: #888; margin-top: 5px;">
+                    Activaciones recientes: <strong>{activaciones_recientes}</strong> | 
+                    Balance D1/D2: <strong>{promedio_ratio*100:.0f}%/{(1-promedio_ratio)*100:.0f}%</strong>
+                </div>
+            </div>
+    """
+    
+    # Mostrar última decisión y historial
+    if modo_automatico and razon_comando:
+        html += f"""
+            <div style="background: #0f3460; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #00ff88;">
+                <strong>🎯 Última adaptación:</strong><br>
+                <span style="font-size: 13px;">{razon_comando}</span>
+            </div>
+        """
+    
+    if historial_decisiones:
+        html += "<div><strong>📜 Historial de Adaptaciones:</strong></div>"
+        for decision in reversed(historial_decisiones[-5:]):
+            html += f'<div class="decision-item">[{decision["timestamp"]}] <strong>{decision["comando"]}</strong>: {decision["razon"]}</div>'
+    
+    html += "</div>"
+    
     # Panel de Estadísticas
     stats = calcular_estadisticas()
     if stats:
@@ -290,6 +610,18 @@ def index():
                     <strong>💡 Recomendación del Sistema:</strong><br>
                     <span style="font-size: 18px;">{stats['recomendacion']}</span>
                 </div>
+                
+                <!-- Gráficas -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px;">
+                    <div style="background: #0f3460; padding: 15px; border-radius: 8px;">
+                        <h3 style="margin: 0 0 10px 0; color: #00d4ff;">📊 Comparación D1 vs D2</h3>
+                        <canvas id="chartBarras" height="200"></canvas>
+                    </div>
+                    <div style="background: #0f3460; padding: 15px; border-radius: 8px;">
+                        <h3 style="margin: 0 0 10px 0; color: #00d4ff;">📈 Flujo Temporal</h3>
+                        <canvas id="chartLineas" height="200"></canvas>
+                    </div>
+                </div>
             </div>
         """
     
@@ -303,6 +635,103 @@ def index():
         for item in reversed(historial[-20:]):
             html += f'<div class="historial-item">{item}</div>'
         html += "</div></div>"
+    
+    # Agregar JavaScript para las gráficas
+    stats = calcular_estadisticas()
+    if stats:
+        # Preparar datos para gráfica temporal
+        datos_temporales = list(datos_analisis)[-20:]  # Últimos 20 registros
+        labels_tiempo = [d.get('timestamp', '')[-8:-3] for d in datos_temporales]  # HH:MM
+        valores_d1 = [d.get('vehiculos_dir1', 0) for d in datos_temporales]
+        valores_d2 = [d.get('vehiculos_dir2', 0) for d in datos_temporales]
+        
+        html += f"""
+        <script>
+            // Gráfica de Barras D1 vs D2
+            const ctxBar = document.getElementById('chartBarras');
+            if (ctxBar) {{
+                new Chart(ctxBar, {{
+                    type: 'bar',
+                    data: {{
+                        labels: ['Dirección 1', 'Dirección 2'],
+                        datasets: [{{
+                            label: 'Total Vehículos',
+                            data: [{stats['total_dir1']}, {stats['total_dir2']}],
+                            backgroundColor: ['rgba(0, 212, 255, 0.7)', 'rgba(255, 170, 0, 0.7)'],
+                            borderColor: ['#00d4ff', '#ffaa00'],
+                            borderWidth: 2
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            legend: {{ display: false }},
+                            title: {{ display: false }}
+                        }},
+                        scales: {{
+                            y: {{
+                                beginAtZero: true,
+                                grid: {{ color: 'rgba(255,255,255,0.1)' }},
+                                ticks: {{ color: '#888' }}
+                            }},
+                            x: {{
+                                grid: {{ display: false }},
+                                ticks: {{ color: '#888' }}
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+            
+            // Gráfica de Líneas Temporal
+            const ctxLine = document.getElementById('chartLineas');
+            if (ctxLine) {{
+                new Chart(ctxLine, {{
+                    type: 'line',
+                    data: {{
+                        labels: {labels_tiempo},
+                        datasets: [
+                            {{
+                                label: 'D1',
+                                data: {valores_d1},
+                                borderColor: '#00d4ff',
+                                backgroundColor: 'rgba(0, 212, 255, 0.1)',
+                                fill: true,
+                                tension: 0.3
+                            }},
+                            {{
+                                label: 'D2',
+                                data: {valores_d2},
+                                borderColor: '#ffaa00',
+                                backgroundColor: 'rgba(255, 170, 0, 0.1)',
+                                fill: true,
+                                tension: 0.3
+                            }}
+                        ]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            legend: {{
+                                labels: {{ color: '#888' }}
+                            }}
+                        }},
+                        scales: {{
+                            y: {{
+                                beginAtZero: true,
+                                grid: {{ color: 'rgba(255,255,255,0.1)' }},
+                                ticks: {{ color: '#888' }}
+                            }},
+                            x: {{
+                                grid: {{ display: false }},
+                                ticks: {{ color: '#888' }}
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+        </script>
+        """
     
     html += """
         </div>
@@ -331,6 +760,12 @@ def recibir_datos():
             # Agregar a datos de análisis (tiempo real)
             agregar_dato_analisis(data)
             
+            # === MODO AUTOMÁTICO: Analizar y decidir ===
+            comando_auto, razon = analizar_y_decidir(data)
+            if comando_auto:
+                print(f"🤖 Decisión automática: {comando_auto} - {razon}")
+                historial.append(f"[{data['timestamp']}] 🤖 AUTO: {comando_auto} ({razon})")
+            
             # Guardar en historial (memoria)
             log_entry = f"[{data['timestamp']}] Estado: {data.get('estado')} | D1: {data.get('vehiculos_dir1')} | D2: {data.get('vehiculos_dir2')} | CO2: {data.get('co2')}"
             historial.append(log_entry)
@@ -350,9 +785,13 @@ def recibir_datos():
             # Si hay comando pendiente, enviarlo
             if comando_pendiente:
                 response["command"] = comando_pendiente
-                print(f"📤 Enviando comando: {comando_pendiente}")
+                print(f"📤 Enviando comando manual: {comando_pendiente}")
                 historial.append(f"[{data['timestamp']}] 📤 COMANDO ENVIADO: {comando_pendiente}")
                 comando_pendiente = None  # Limpiar después de enviar
+            # Si hay comando automático, enviarlo
+            elif comando_auto:
+                response["command"] = comando_auto
+                print(f"🤖 Enviando comando automático: {comando_auto}")
             
             return jsonify(response), 200
         else:
@@ -387,6 +826,22 @@ def enviar_comando():
         historial.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🎮 COMANDO PROGRAMADO: {cmd}")
     
     # Redirigir de vuelta al dashboard
+    from flask import redirect
+    return redirect('/')
+
+
+@app.route('/api/auto', methods=['POST'])
+def toggle_automatico():
+    """Endpoint para activar/desactivar el modo automático"""
+    global modo_automatico, ultimo_comando_auto
+    
+    modo_automatico = not modo_automatico
+    ultimo_comando_auto = None  # Resetear último comando
+    
+    estado = "ACTIVADO" if modo_automatico else "DESACTIVADO"
+    print(f"🤖 Modo automático: {estado}")
+    historial.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🤖 MODO AUTOMÁTICO: {estado}")
+    
     from flask import redirect
     return redirect('/')
 

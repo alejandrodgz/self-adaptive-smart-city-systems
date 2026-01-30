@@ -44,9 +44,23 @@ const char* SERVER_URL = "http://192.168.78.103:5000/api/traffic";  // IP de tu 
 // -- Configuración --
 #define NIGHT_MODE_THRESHOLD 300
 #define HEAVY_TRAFFIC_DIFF 3
-#define PEDESTRIAN_CROSS_TIME 15000
-#define CO2_HIGH_THRESHOLD 400
+#define CO2_HIGH_THRESHOLD 600
 #define TIEMPO_RESET_CONTADOR 60000
+
+// =================================================================
+//  SETPOINTS ADAPTATIVOS - Modificables por el servidor
+// =================================================================
+// Tiempos base en milisegundos (pueden ser ajustados remotamente)
+int SP_VERDE_NORMAL = 10000;       // Tiempo verde modo normal
+int SP_AMARILLO = 3000;            // Tiempo amarillo
+int SP_VERDE_NOCTURNO = 6000;      // Tiempo verde modo nocturno
+int SP_VERDE_PESADO_MAX = 15000;   // Tiempo verde máximo tráfico pesado
+int SP_VERDE_PESADO_MIN = 5000;    // Tiempo verde mínimo tráfico pesado
+int SP_VERDE_EMISION = 20000;      // Tiempo verde modo emisión
+int SP_PEATONAL = 15000;           // Tiempo cruce peatonal
+
+// Contador de activaciones (para enviar al servidor)
+int contadorPeatonalActivado = 0;
 
 // -- Pantalla LCD --
 LiquidCrystal_I2C lcd(0x27, 20, 4);
@@ -92,6 +106,8 @@ int co2Value = 0;
 // -- Modo Peatonal --
 volatile bool solicitudPeatonal = false;
 unsigned long tiempoInicioModoPeatonal = 0;
+unsigned long tiempoFinModoPeatonal = 0;
+#define COOLDOWN_PEATONAL 3000  // 3 segundos antes de permitir otra activación
 
 // -- Timers --
 unsigned long tiempoUltimoReset = 0;
@@ -106,6 +122,10 @@ bool wifiConnected = false;
 bool modoForzadoPorServidor = false;
 unsigned long tiempoModoForzado = 0;
 #define DURACION_MODO_FORZADO 30000  // 30 segundos de bloqueo
+
+// -- Cooldown para cambios de modo automáticos --
+unsigned long ultimoCambioModoAuto = 0;
+#define COOLDOWN_CAMBIO_MODO 5000  // Mínimo 5 segundos entre cambios automáticos
 
 // =================================================================
 //  FUNCIONES WiFi
@@ -196,7 +216,7 @@ void enviarDatosServidor() {
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
   
-  // Construir JSON con datos del sistema
+  // Construir JSON con datos del sistema + setpoints actuales
   String json = "{";
   json += "\"estado\":\"" + obtenerNombreEstado() + "\",";
   json += "\"fase\":\"" + obtenerNombreFase() + "\",";
@@ -205,7 +225,13 @@ void enviarDatosServidor() {
   json += "\"ldr1\":" + String(ldr1Value) + ",";
   json += "\"ldr2\":" + String(ldr2Value) + ",";
   json += "\"co2\":" + String(co2Value) + ",";
-  json += "\"wifi_rssi\":" + String(WiFi.RSSI());
+  json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+  // Enviar setpoints actuales y contadores para análisis
+  json += "\"sp_verde_normal\":" + String(SP_VERDE_NORMAL) + ",";
+  json += "\"sp_peatonal\":" + String(SP_PEATONAL) + ",";
+  json += "\"sp_verde_pesado_max\":" + String(SP_VERDE_PESADO_MAX) + ",";
+  json += "\"sp_verde_pesado_min\":" + String(SP_VERDE_PESADO_MIN) + ",";
+  json += "\"contador_peatonal\":" + String(contadorPeatonalActivado);
   json += "}";
   
   Serial.print("Enviando: ");
@@ -252,7 +278,15 @@ void procesarComandoServidor(String response) {
   Serial.print(">>> COMANDO RECIBIDO: ");
   Serial.println(comando);
   
-  // Ejecutar el comando
+  // ===============================================================
+  // COMANDOS DE AJUSTE ADAPTATIVO: AJUSTAR:PARAM:VALOR
+  // ===============================================================
+  if (comando.startsWith("AJUSTAR:")) {
+    procesarAjuste(comando);
+    return;
+  }
+  
+  // Ejecutar el comando de modo
   if (comando == "PEATONAL") {
     // Solo marcar la solicitud, el loop lo activará correctamente
     solicitudPeatonal = true;
@@ -287,6 +321,78 @@ void procesarComandoServidor(String response) {
 }
 
 // =================================================================
+//  PROCESAR AJUSTES ADAPTATIVOS
+// =================================================================
+void procesarAjuste(String comando) {
+  // Formato: AJUSTAR:PARAM:VALOR
+  // Ejemplo: AJUSTAR:SP_PEATONAL:18000
+  
+  int primerDosPuntos = comando.indexOf(':');
+  int segundoDosPuntos = comando.indexOf(':', primerDosPuntos + 1);
+  
+  if (primerDosPuntos == -1 || segundoDosPuntos == -1) {
+    Serial.println(">>> Error: formato de ajuste inválido");
+    return;
+  }
+  
+  String parametro = comando.substring(primerDosPuntos + 1, segundoDosPuntos);
+  int valor = comando.substring(segundoDosPuntos + 1).toInt();
+  
+  Serial.print(">>> AJUSTE ADAPTATIVO: ");
+  Serial.print(parametro);
+  Serial.print(" = ");
+  Serial.println(valor);
+  
+  // Aplicar el ajuste al setpoint correspondiente
+  bool ajusteAplicado = false;
+  int valorAnterior = 0;
+  
+  if (parametro == "SP_VERDE_NORMAL") {
+    valorAnterior = SP_VERDE_NORMAL;
+    SP_VERDE_NORMAL = valor;
+    ajusteAplicado = true;
+  }
+  else if (parametro == "SP_PEATONAL") {
+    valorAnterior = SP_PEATONAL;
+    SP_PEATONAL = valor;
+    ajusteAplicado = true;
+  }
+  else if (parametro == "SP_VERDE_PESADO_MAX") {
+    valorAnterior = SP_VERDE_PESADO_MAX;
+    SP_VERDE_PESADO_MAX = valor;
+    ajusteAplicado = true;
+  }
+  else if (parametro == "SP_VERDE_PESADO_MIN") {
+    valorAnterior = SP_VERDE_PESADO_MIN;
+    SP_VERDE_PESADO_MIN = valor;
+    ajusteAplicado = true;
+  }
+  else if (parametro == "RESET_PEATONAL") {
+    contadorPeatonalActivado = 0;
+    Serial.println(">>> Contador peatonal reseteado");
+    return;
+  }
+  
+  if (ajusteAplicado) {
+    Serial.print(">>> Setpoint actualizado: ");
+    Serial.print(valorAnterior);
+    Serial.print(" -> ");
+    Serial.println(valor);
+    
+    // Mostrar en LCD
+    lcd.clear();
+    lcd.print("AJUSTE IA:");
+    lcd.setCursor(0, 1);
+    lcd.print(parametro.substring(3, 10)); // Acortar nombre
+    lcd.setCursor(0, 2);
+    lcd.print(valorAnterior);
+    lcd.print(" -> ");
+    lcd.print(valor);
+    lcd.print("ms");
+  }
+}
+
+// =================================================================
 void setup() {
   Serial.begin(115200);
   
@@ -312,7 +418,11 @@ void setup() {
   // Conectar WiFi
   conectarWiFi();
   
+  // Inicializar máquina de estados - comenzar con D1 en verde
+  faseActual = FASE_TL1_VERDE;
   tiempoInicioFase = millis();
+  duracionFaseActual = 0;  // Forzar entrada inmediata a la primera fase
+  
   lcd.clear();
 }
 
@@ -327,12 +437,10 @@ void loop() {
   }
   
   // ===== ENVIAR DATOS AL SERVIDOR (cada 5 segundos) =====
-  // NO enviar durante modo peatonal para no interrumpir el ciclo
-  if (tiempoActual - ultimoEnvioServidor >= SEND_INTERVAL && estadoActual != PEATONAL) {
+  if (tiempoActual - ultimoEnvioServidor >= SEND_INTERVAL) {
     enviarDatosServidor();
     ultimoEnvioServidor = tiempoActual;
     // IMPORTANTE: Recalcular tiempo después de operación HTTP lenta
-    // Esto evita underflow en tiempoTranscurrido del modo peatonal
     tiempoActual = millis();
   }
   
@@ -344,8 +452,14 @@ void loop() {
   }
   
   // ===== MANEJAR SOLICITUD PEATONAL =====
+  // Verificar cooldown para evitar reactivación inmediata
   if (solicitudPeatonal && estadoActual != PEATONAL && co2Value <= CO2_HIGH_THRESHOLD) {
-    activarModoPeatonal();
+    if (tiempoActual - tiempoFinModoPeatonal >= COOLDOWN_PEATONAL) {
+      activarModoPeatonal();
+    } else {
+      solicitudPeatonal = false;  // Ignorar, muy pronto desde el último
+      Serial.println("BLOQUEADO: Cooldown peatonal activo");
+    }
   } else if (solicitudPeatonal && co2Value > CO2_HIGH_THRESHOLD) {
     solicitudPeatonal = false;
     Serial.println("BLOQUEADO: Modo peatonal cancelado por CO2 alto");
@@ -416,6 +530,12 @@ void determinarModo() {
     }
   }
   
+  // Cooldown: evitar cambios automáticos muy frecuentes
+  // Esto NO afecta comandos del servidor (ya manejados arriba)
+  if (millis() - ultimoCambioModoAuto < COOLDOWN_CAMBIO_MODO) {
+    return; // Esperar antes de permitir otro cambio automático
+  }
+  
   Estado modoAnterior = estadoActual;
   
   if (co2Value > CO2_HIGH_THRESHOLD) {
@@ -431,6 +551,8 @@ void determinarModo() {
   if (modoAnterior != estadoActual && estadoActual != PEATONAL) {
     faseActual = FASE_TL1_VERDE;
     tiempoInicioFase = millis();
+    duracionFaseActual = 0;  // Forzar entrada inmediata a la nueva fase
+    ultimoCambioModoAuto = millis();  // Registrar tiempo del cambio
     Serial.print("CAMBIO DE MODO: ");
     Serial.println(obtenerNombreEstado());
   }
@@ -444,29 +566,29 @@ TiemposModo obtenerTiempos() {
   
   switch(estadoActual) {
     case NORMAL:
-      t.verdeDir1 = 10000; t.amarilloDir1 = 3000;
-      t.verdeDir2 = 10000; t.amarilloDir2 = 3000;
+      t.verdeDir1 = SP_VERDE_NORMAL; t.amarilloDir1 = SP_AMARILLO;
+      t.verdeDir2 = SP_VERDE_NORMAL; t.amarilloDir2 = SP_AMARILLO;
       break;
     case NOCTURNO:
-      t.verdeDir1 = 6000; t.amarilloDir1 = 2000;
-      t.verdeDir2 = 6000; t.amarilloDir2 = 2000;
+      t.verdeDir1 = SP_VERDE_NOCTURNO; t.amarilloDir1 = 2000;
+      t.verdeDir2 = SP_VERDE_NOCTURNO; t.amarilloDir2 = 2000;
       break;
     case TRAFICO_PESADO:
       if (vehicleCount1 > vehicleCount2) {
-        t.verdeDir1 = 15000; t.amarilloDir1 = 3000;
-        t.verdeDir2 = 5000;  t.amarilloDir2 = 3000;
+        t.verdeDir1 = SP_VERDE_PESADO_MAX; t.amarilloDir1 = SP_AMARILLO;
+        t.verdeDir2 = SP_VERDE_PESADO_MIN; t.amarilloDir2 = SP_AMARILLO;
       } else {
-        t.verdeDir1 = 5000;  t.amarilloDir1 = 3000;
-        t.verdeDir2 = 15000; t.amarilloDir2 = 3000;
+        t.verdeDir1 = SP_VERDE_PESADO_MIN; t.amarilloDir1 = SP_AMARILLO;
+        t.verdeDir2 = SP_VERDE_PESADO_MAX; t.amarilloDir2 = SP_AMARILLO;
       }
       break;
     case EMISION:
-      t.verdeDir1 = 20000; t.amarilloDir1 = 2000;
-      t.verdeDir2 = 20000; t.amarilloDir2 = 2000;
+      t.verdeDir1 = SP_VERDE_EMISION; t.amarilloDir1 = 2000;
+      t.verdeDir2 = SP_VERDE_EMISION; t.amarilloDir2 = 2000;
       break;
     default:
-      t.verdeDir1 = 10000; t.amarilloDir1 = 3000;
-      t.verdeDir2 = 10000; t.amarilloDir2 = 3000;
+      t.verdeDir1 = SP_VERDE_NORMAL; t.amarilloDir1 = SP_AMARILLO;
+      t.verdeDir2 = SP_VERDE_NORMAL; t.amarilloDir2 = SP_AMARILLO;
   }
   
   return t;
@@ -478,47 +600,57 @@ TiemposModo obtenerTiempos() {
 void ejecutarMaquinaEstados(unsigned long tiempoActual) {
   TiemposModo tiempos = obtenerTiempos();
   
+  // Si no ha pasado el tiempo de la fase actual, mantener luces y salir
   if (tiempoActual - tiempoInicioFase < duracionFaseActual) {
     return;
   }
   
+  // Cambiar a la siguiente fase
   tiempoInicioFase = tiempoActual;
-  FaseSemaforo siguienteFase = faseActual;
   
   switch(faseActual) {
     case FASE_TL1_VERDE:
+      // Verde para D1, Rojo para D2
+      establecerLuces(true, false, false, false, false, true);  // G1, Y1, R1, G2, Y2, R2
+      duracionFaseActual = tiempos.verdeDir1;
+      faseActual = FASE_TL1_AMARILLO;  // Próxima fase después del tiempo
+      break;
+      
+    case FASE_TL1_AMARILLO:
+      // Amarillo para D1, Rojo para D2
       establecerLuces(false, true, false, false, false, true);
       duracionFaseActual = tiempos.amarilloDir1;
-      siguienteFase = FASE_TL1_AMARILLO;
+      faseActual = FASE_TL1_ROJO;
       break;
-    case FASE_TL1_AMARILLO:
-      todasLucesRojas();
-      duracionFaseActual = 1000;
-      siguienteFase = FASE_TL1_ROJO;
-      break;
+      
     case FASE_TL1_ROJO:
+      // Transición: Todo rojo brevemente
+      todasLucesRojas();
+      duracionFaseActual = 1000;  // 1 segundo de seguridad
+      faseActual = FASE_TL2_VERDE;
+      break;
+      
+    case FASE_TL2_VERDE:
+      // Rojo para D1, Verde para D2
       establecerLuces(false, false, true, true, false, false);
       duracionFaseActual = tiempos.verdeDir2;
-      siguienteFase = FASE_TL2_VERDE;
+      faseActual = FASE_TL2_AMARILLO;
       break;
-    case FASE_TL2_VERDE:
+      
+    case FASE_TL2_AMARILLO:
+      // Rojo para D1, Amarillo para D2
       establecerLuces(false, false, true, false, true, false);
       duracionFaseActual = tiempos.amarilloDir2;
-      siguienteFase = FASE_TL2_AMARILLO;
+      faseActual = FASE_TL2_ROJO;
       break;
-    case FASE_TL2_AMARILLO:
-      todasLucesRojas();
-      duracionFaseActual = 1000;
-      siguienteFase = FASE_TL2_ROJO;
-      break;
+      
     case FASE_TL2_ROJO:
-      establecerLuces(true, false, false, false, false, true);
-      duracionFaseActual = tiempos.verdeDir1;
-      siguienteFase = FASE_TL1_VERDE;
+      // Transición: Todo rojo brevemente
+      todasLucesRojas();
+      duracionFaseActual = 1000;  // 1 segundo de seguridad
+      faseActual = FASE_TL1_VERDE;  // Volver al inicio del ciclo
       break;
   }
-  
-  faseActual = siguienteFase;
 }
 
 // =================================================================
@@ -528,7 +660,10 @@ void activarModoPeatonal() {
   estadoActual = PEATONAL;
   solicitudPeatonal = false;
   tiempoInicioModoPeatonal = millis();
-  Serial.println("MODO PEATONAL ACTIVADO");
+  contadorPeatonalActivado++;  // Incrementar para análisis del servidor
+  Serial.print("MODO PEATONAL ACTIVADO (total: ");
+  Serial.print(contadorPeatonalActivado);
+  Serial.println(")");
 }
 
 void ejecutarModoPeatonal(unsigned long tiempoActual) {
@@ -550,11 +685,11 @@ void ejecutarModoPeatonal(unsigned long tiempoActual) {
       lcd.print("s");
     }
   }
-  else if (tiempoTranscurrido < 3000 + PEDESTRIAN_CROSS_TIME) {
+  else if (tiempoTranscurrido < 3000 + SP_PEATONAL) {
     todasLucesRojas();
     
     static int ultimoSegundo = -1;
-    int segundosRestantes = (3000 + PEDESTRIAN_CROSS_TIME - tiempoTranscurrido) / 1000;
+    int segundosRestantes = (3000 + SP_PEATONAL - tiempoTranscurrido) / 1000;
     if (segundosRestantes != ultimoSegundo) {
       ultimoSegundo = segundosRestantes;
       lcd.clear();
@@ -565,8 +700,8 @@ void ejecutarModoPeatonal(unsigned long tiempoActual) {
       lcd.print("s");
     }
   }
-  else if (tiempoTranscurrido < 3000 + PEDESTRIAN_CROSS_TIME + 2000) {
-    int ciclo = (tiempoTranscurrido - 3000 - PEDESTRIAN_CROSS_TIME) / 500;
+  else if (tiempoTranscurrido < 3000 + SP_PEATONAL + 2000) {
+    int ciclo = (tiempoTranscurrido - 3000 - SP_PEATONAL) / 500;
     if (ciclo % 2 == 0) {
       digitalWrite(LY1, HIGH);
       digitalWrite(LY2, HIGH);
@@ -579,6 +714,8 @@ void ejecutarModoPeatonal(unsigned long tiempoActual) {
     faseActual = FASE_TL1_VERDE;
     tiempoInicioFase = millis();
     duracionFaseActual = 0;
+    tiempoFinModoPeatonal = millis();  // Registrar fin para cooldown
+    solicitudPeatonal = false;  // Limpiar cualquier solicitud pendiente
     establecerLuces(true, false, false, false, false, true);
     Serial.println("MODO PEATONAL FINALIZADO");
   }
